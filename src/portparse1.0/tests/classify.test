@@ -1,0 +1,226 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+#
+# Classification queries over the directives table: classify, resolve,
+# directives, directives_in_category, field_setters, and the categories
+# accessor. Invariant tests (shape, mutation-safety, enum-closedness) pin
+# the public contract.
+
+package require tcltest 2
+namespace import tcltest::*
+
+source [file join [file dirname [info script]] library.tcl]
+package require portparse 1.0
+
+# -- categories enum -------------------------------------------------------
+
+test categories-order {categories returns the declared order} -body {
+    portparse::categories
+} -result {identity metadata source dependency build-config phase}
+
+test categories-fresh-copy {categories returns a fresh list each call} -body {
+    set a [portparse::categories]
+    lappend a junk
+    set b [portparse::categories]
+    expr {"junk" in $b}
+} -result 0
+
+# -- directives accessor ---------------------------------------------------
+
+test directives-nonempty {directives returns a non-empty dict} -body {
+    expr {[dict size [portparse::directives]] > 50}
+} -result 1
+
+test directives-entry-shape {every entry has sets and category keys} -body {
+    set bad [list]
+    dict for {name entry} [portparse::directives] {
+        if {![dict exists $entry sets] || ![dict exists $entry category]} {
+            lappend bad $name
+        }
+    }
+    set bad
+} -result {}
+
+test directives-categories-are-in-enum {every entry's category is in [categories]} -body {
+    set enum [portparse::categories]
+    set bad [list]
+    dict for {name entry} [portparse::directives] {
+        if {[dict get $entry category] ni $enum} {
+            lappend bad "$name -> [dict get $entry category]"
+        }
+    }
+    set bad
+} -result {}
+
+test directives-fresh-copy {directives returns a fresh dict each call} -body {
+    set a [portparse::directives]
+    dict set a zzznonsense {sets {} category identity}
+    set b [portparse::directives]
+    dict exists $b zzznonsense
+} -result 0
+
+# -- resolve by name -------------------------------------------------------
+
+test resolve-identity-version {version resolves to identity} -body {
+    set r [portparse::resolve version]
+    list [dict get $r kind] [dict get $r category]
+} -result {port-directive identity}
+
+test resolve-dependency-depends-lib {depends_lib resolves to dependency} -body {
+    dict get [portparse::resolve depends_lib] category
+} -result dependency
+
+test resolve-phase-variant {variant resolves to phase} -body {
+    dict get [portparse::resolve variant] category
+} -result phase
+
+test resolve-tcl-control-foreach {foreach is tcl-control, not a directive} -body {
+    portparse::resolve foreach
+} -result {kind tcl-control}
+
+test resolve-tcl-control-if {if is tcl-control} -body {
+    portparse::resolve if
+} -result {kind tcl-control}
+
+test resolve-unknown {unknown names classify as unknown} -body {
+    portparse::resolve not-a-real-directive
+} -result {kind unknown}
+
+# -- suffix-alias resolution (options / commands bases) --------------------
+# Aliases -append/-prepend/-delete/-strsed/-replace apply only to
+# directives registered via `options` (directly or transitively via
+# `commands`). Phase-category and non-option procs must not over-match.
+
+test resolve-suffix-alias-options-base \
+    {depends_lib-append resolves to its options-registered base} -body {
+    dict get [portparse::resolve depends_lib-append] category
+} -result dependency
+
+test resolve-suffix-alias-commands-base \
+    {configure.args-append resolves (commands fan-out is options-backed)} -body {
+    dict get [portparse::resolve configure.args-append] category
+} -result build-config
+
+test resolve-suffix-alias-phase-excluded \
+    {pre-configure-append is NOT a directive — pre-configure is a target hook} -body {
+    portparse::resolve pre-configure-append
+} -result {kind unknown}
+
+test resolve-suffix-alias-variant-excluded \
+    {variant-append is NOT a directive — variant is a proc, not an option} -body {
+    portparse::resolve variant-append
+} -result {kind unknown}
+
+test resolve-suffix-alias-portgroup-excluded \
+    {PortGroup-append is NOT a directive — PortGroup is a proc} -body {
+    portparse::resolve PortGroup-append
+} -result {kind unknown}
+
+# -- classify (node-based) -------------------------------------------------
+
+test classify-command-node {classify pulls the first-word name off a command node} -body {
+    set cst [tclparse::parse "version 1.0"]
+    set cmd [lindex [dict get $cst nodes] 0]
+    dict get [portparse::classify $cmd] category
+} -result identity
+
+test classify-non-command-empty {classify returns an empty dict for non-command nodes} -body {
+    set cst [tclparse::parse "version 1.0\n"]
+    # Index 1 is the trailing whitespace node.
+    set ws [lindex [dict get $cst nodes] 1]
+    portparse::classify $ws
+} -result {}
+
+test classify-agrees-with-resolve {classify on a node matches resolve on the name} -body {
+    set cst [tclparse::parse "depends_lib port:foo"]
+    set cmd [lindex [dict get $cst nodes] 0]
+    expr {[portparse::classify $cmd] eq [portparse::resolve depends_lib]}
+} -result 1
+
+# -- directives_in_category ------------------------------------------------
+
+test in-category-identity-contents {identity contains the four expected names} -body {
+    portparse::directives_in_category identity
+} -result {epoch name revision version}
+
+test in-category-unknown-empty {unknown category → empty list (not an error)} -body {
+    portparse::directives_in_category not-a-category
+} -result {}
+
+test in-category-phase-has-variant {phase category includes variant} -body {
+    expr {"variant" in [portparse::directives_in_category phase]}
+} -result 1
+
+test in-category-dependency-has-replaced_by {dependency includes replaced_by} -body {
+    expr {"replaced_by" in [portparse::directives_in_category dependency]}
+} -result 1
+
+# -- field_setters ---------------------------------------------------------
+
+test field-setters-name {field_setters name returns directives that set "name"} -body {
+    portparse::field_setters name
+} -result {name}
+
+test field-setters-unknown-empty {unknown field → empty list} -body {
+    portparse::field_setters not-a-field
+} -result {}
+
+# -- base directive coverage (spot-checks against the plan) ---------------
+
+test coverage-identity {every identity directive listed in the plan is present} -body {
+    set want {name version epoch revision PortSystem PortGroup}
+    set have [portparse::directives]
+    set missing [list]
+    foreach n $want {
+        if {![dict exists $have $n]} { lappend missing $n }
+    }
+    set missing
+} -result {}
+
+test coverage-dependencies {every depends_* variant is present} -body {
+    set want {depends_lib depends_build depends_run depends_test
+              depends_fetch depends_extract depends_patch conflicts replaced_by}
+    set have [portparse::directives]
+    set missing [list]
+    foreach n $want {
+        if {![dict exists $have $n]} { lappend missing $n }
+    }
+    set missing
+} -result {}
+
+test coverage-phase-hooks {pre-/post- hooks for every target_provides target are present} -body {
+    set targets {activate bump build checksum clean configure deactivate
+                 destroot distcheck distfiles extract fetch install lint
+                 livecheck load main mirror patch reload test uninstall
+                 unload}
+    set have [portparse::directives]
+    set missing [list]
+    foreach t $targets {
+        foreach prefix {pre- post-} {
+            set n "${prefix}${t}"
+            if {![dict exists $have $n]} { lappend missing $n }
+        }
+    }
+    set missing
+} -result {}
+
+test coverage-dynamic-use-options {every member of portextract::all_use_options is present} -body {
+    set want {use_7z use_bzip2 use_dmg use_lzip use_lzma use_tar use_xz use_zip}
+    set have [portparse::directives]
+    set missing [list]
+    foreach n $want {
+        if {![dict exists $have $n]} { lappend missing $n }
+    }
+    set missing
+} -result {}
+
+test coverage-dynamic-archflags {configure.<tool>_archflags for each tool is present} -body {
+    set have [portparse::directives]
+    set missing [list]
+    foreach tool {cc objc f77 f90 fc cxx objcxx} {
+        set n "configure.${tool}_archflags"
+        if {![dict exists $have $n]} { lappend missing $n }
+    }
+    set missing
+} -result {}
+
+cleanupTests

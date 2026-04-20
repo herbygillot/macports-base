@@ -1,0 +1,31 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+
+PortSystem      1.0
+
+name            nested-variants
+version         1.0
+categories      test
+license         BSD
+platforms       darwin
+supported_archs noarch
+
+variant ssl description "SSL support" {
+    depends_lib-append      port:openssl
+    configure.args-append   --with-ssl
+}
+
+variant python27 description "Python 2.7 bindings" {
+    depends_lib-append      port:python27
+    variant python27_extras description "Extras for py27" {
+        depends_lib-append  port:py27-foo
+    }
+}
+
+subport ${name}-tools {
+    description     Command-line tools for ${name}
+    depends_lib     port:${name}
+    build           {}
+    destroot {
+        xinstall ${worksrcpath}/bin/tools ${destroot}${prefix}/bin/
+    }
+}

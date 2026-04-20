@@ -1,0 +1,359 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+#
+# Lexer tests. Exercises tclparse::lex::scan directly — this is internal,
+# but its output contract is worth pinning because later layers depend on it.
+
+package require tcltest 2
+namespace import tcltest::*
+
+source [file join [file dirname [info script]] library.tcl]
+package require tclparse 1.0
+
+# -- Helpers ---------------------------------------------------------------
+
+# Flatten the proto-token stream into {kind text} pairs, optionally with
+# word_kind appended for word tokens. Used to make assertions readable.
+proc kinds_texts {tokens} {
+    set out [list]
+    foreach tok $tokens {
+        set kind [dict get $tok kind]
+        set text [dict get $tok text]
+        if {$kind eq "word"} {
+            lappend out [list $kind [dict get $tok word_kind] $text]
+        } else {
+            lappend out [list $kind $text]
+        }
+    }
+    return $out
+}
+
+# Concatenate every token's text. For a well-formed input the result must
+# equal the original text byte-for-byte. Terminator has no text — it
+# represents an implicit ";" — so we substitute it.
+proc reconstruct {tokens} {
+    set out ""
+    foreach tok $tokens {
+        set kind [dict get $tok kind]
+        if {$kind eq "terminator"} {
+            append out ";"
+        } else {
+            append out [dict get $tok text]
+        }
+    }
+    return $out
+}
+
+# -- Whitespace / empty ----------------------------------------------------
+
+test lex-empty-1 {Empty input produces an empty token list} -body {
+    tclparse::lex::scan ""
+} -result {}
+
+test lex-whitespace-1 {A run of spaces becomes one whitespace token} -body {
+    set t [tclparse::lex::scan "   "]
+    list [llength $t] [dict get [lindex $t 0] kind] [dict get [lindex $t 0] text]
+} -result {1 whitespace {   }}
+
+test lex-whitespace-2 {Mixed whitespace coalesces; newlines included} -body {
+    set t [tclparse::lex::scan " \t\n\r\f\v"]
+    list [llength $t] [dict get [lindex $t 0] kind] [dict get [lindex $t 0] text]
+} -result [list 1 whitespace " \t\n\r\f\v"]
+
+test lex-whitespace-3 {Backslash-newline continuation is part of whitespace} -body {
+    set t [tclparse::lex::scan "set x \\\n    1"]
+    kinds_texts $t
+} -result [list [list word bare set] [list whitespace " "] [list word bare x] [list whitespace " \\\n    "] [list word bare 1]]
+
+# -- Terminator ------------------------------------------------------------
+
+test lex-terminator-1 {Semicolon becomes a terminator token with text ";"} -body {
+    set t [tclparse::lex::scan "a ; b"]
+    kinds_texts $t
+} -result [list [list word bare a] [list whitespace { }] [list terminator {;}] [list whitespace { }] [list word bare b]]
+
+test lex-terminator-2 {Multiple adjacent terminators each produce their own token} -body {
+    set t [tclparse::lex::scan "a;b;c"]
+    kinds_texts $t
+} -result [list [list word bare a] [list terminator {;}] [list word bare b] [list terminator {;}] [list word bare c]]
+
+# -- Comments --------------------------------------------------------------
+
+test lex-comment-1 {# at start of file begins a comment} -body {
+    set t [tclparse::lex::scan "# hello\nset x 1"]
+    set c [lindex $t 0]
+    list [dict get $c kind] [dict get $c text]
+} -result {comment {# hello}}
+
+test lex-comment-2 {# after a terminator starts a new comment} -body {
+    set t [tclparse::lex::scan "puts a;# trailing"]
+    set kinds [list]
+    foreach tok $t { lappend kinds [dict get $tok kind] }
+    set kinds
+} -result {word whitespace word terminator comment}
+
+test lex-comment-3 {# mid-word is literal, not a comment} -body {
+    set t [tclparse::lex::scan "set x#foo"]
+    # "x#foo" is one bare word — the # is not at command start.
+    set words [list]
+    foreach tok $t {
+        if {[dict get $tok kind] eq "word"} {
+            lappend words [dict get $tok text]
+        }
+    }
+    set words
+} -result {set x#foo}
+
+test lex-comment-4 {# inside a quoted word is literal} -body {
+    set t [tclparse::lex::scan "set msg \"# not a comment\""]
+    set words [list]
+    foreach tok $t {
+        if {[dict get $tok kind] eq "word"} {
+            lappend words [list [dict get $tok word_kind] [dict get $tok text]]
+        }
+    }
+    set words
+} -result {{bare set} {bare msg} {quoted {"# not a comment"}}}
+
+test lex-comment-5 {Backslash-newline continues a command-start comment} -body {
+    set src " # foo bar\\\ncomment on continuation line\nfoo"
+    set t [tclparse::lex::scan $src]
+    kinds_texts $t
+} -result [list \
+    [list whitespace " "] \
+    [list comment "# foo bar\\\ncomment on continuation line"] \
+    [list whitespace "\n"] \
+    [list word bare foo]]
+
+test lex-comment-6 {Comment ending with backslash-newline at EOF stays one comment token} -body {
+    set src "#   \\\n"
+    set t [tclparse::lex::scan $src]
+    kinds_texts $t
+} -result [list [list comment "#   \\\n"]]
+
+# -- Bare words ------------------------------------------------------------
+
+test lex-bare-1 {Simple bare word} -body {
+    set t [tclparse::lex::scan "hello"]
+    list [llength $t] [dict get [lindex $t 0] kind] [dict get [lindex $t 0] word_kind] [dict get [lindex $t 0] text]
+} -result {1 word bare hello}
+
+test lex-bare-2 {Bare word with $var is composite} -body {
+    set src {value_$name}
+    set t [tclparse::lex::scan $src]
+    set w [lindex $t 0]
+    list [dict get $w word_kind] [expr {[dict get $w text] eq $src}]
+} -result {composite 1}
+
+test lex-bare-3 {Bare word with dollar-brace var is composite} -body {
+    set src {pre${var}post}
+    set t [tclparse::lex::scan $src]
+    set w [lindex $t 0]
+    list [dict get $w word_kind] [expr {[dict get $w text] eq $src}]
+} -result {composite 1}
+
+test lex-bare-4 {Bare word with command sub is composite} -body {
+    set src {pre[cmd arg]post}
+    set t [tclparse::lex::scan $src]
+    set w [lindex $t 0]
+    list [dict get $w word_kind] [expr {[dict get $w text] eq $src}]
+} -result {composite 1}
+
+test lex-bare-5 {$name does not end at : unless ::} -body {
+    set src {$foo::bar}
+    set t [tclparse::lex::scan $src]
+    set w [lindex $t 0]
+    list [dict get $w word_kind] [expr {[dict get $w text] eq $src}]
+} -result {composite 1}
+
+test lex-bare-6 {Escaped ] inside command substitution does not terminate it} -body {
+    set src {[foo \] [a b]]}
+    set t [tclparse::lex::scan $src]
+    set w [lindex $t 0]
+    list [dict get $w word_kind] [expr {[dict get $w text] eq $src}]
+} -result {composite 1}
+
+# -- Braced words ----------------------------------------------------------
+
+test lex-braced-1 {Simple braced word} -body {
+    set t [tclparse::lex::scan "{a b c}"]
+    set w [lindex $t 0]
+    list [dict get $w word_kind] [dict get $w text]
+} -result {braced {{a b c}}}
+
+test lex-braced-2 {Nested braces tracked} -body {
+    set t [tclparse::lex::scan "{outer {inner} tail}"]
+    set w [lindex $t 0]
+    list [dict get $w word_kind] [dict get $w text]
+} -result {braced {{outer {inner} tail}}}
+
+test lex-braced-3 {Backslash-brace does not affect nesting} -body {
+    set src "\{a \\\{ b\}"
+    set t [tclparse::lex::scan $src]
+    set w [lindex $t 0]
+    expr {[dict get $w text] eq $src}
+} -result 1
+
+test lex-braced-4 {Empty braces are valid} -body {
+    set t [tclparse::lex::scan "{}"]
+    set w [lindex $t 0]
+    list [dict get $w word_kind] [dict get $w text]
+} -result {braced {{}}}
+
+# -- Quoted words ----------------------------------------------------------
+
+test lex-quoted-1 {Simple quoted word} -body {
+    set t [tclparse::lex::scan "\"hello world\""]
+    set w [lindex $t 0]
+    list [dict get $w word_kind] [dict get $w text]
+} -result {quoted {"hello world"}}
+
+test lex-quoted-2 {Escaped quote inside quoted word} -body {
+    set t [tclparse::lex::scan "\"a \\\" b\""]
+    set w [lindex $t 0]
+    dict get $w text
+} -result {"a \" b"}
+
+test lex-quoted-3 {Backslash-newline after a quoted word terminates the word} -body {
+    set t [tclparse::lex::scan "foo \"bar\"\\\nx"]
+    kinds_texts $t
+} -result [list \
+    [list word bare foo] \
+    [list whitespace " "] \
+    [list word quoted "\"bar\""] \
+    [list whitespace "\\\n"] \
+    [list word bare x]]
+
+test lex-braced-5 {Backslash-newline after a braced word terminates the word} -body {
+    set t [tclparse::lex::scan "foo {bar}\\\nx"]
+    kinds_texts $t
+} -result [list \
+    [list word bare foo] \
+    [list whitespace " "] \
+    [list word braced "{bar}"] \
+    [list whitespace "\\\n"] \
+    [list word bare x]]
+
+# -- BOM -------------------------------------------------------------------
+
+test lex-bom-1 {UTF-8 BOM at position 0 is its own unknown token at {1 1}} -body {
+    set t [tclparse::lex::scan "\uFEFFset x 1"]
+    set b [lindex $t 0]
+    list [dict get $b kind] [dict get $b text] [dict get $b line] [dict get $b col]
+} -result [list unknown "\uFEFF" 1 1]
+
+test lex-bom-2 {First character after BOM reports col 2} -body {
+    set t [tclparse::lex::scan "\uFEFFset"]
+    set w [lindex $t 1]
+    list [dict get $w line] [dict get $w col] [dict get $w text]
+} -result {1 2 set}
+
+test lex-bom-3 {U+FEFF mid-file is a literal bare-word char} -body {
+    set t [tclparse::lex::scan "set x\uFEFFy"]
+    set words [list]
+    foreach tok $t {
+        if {[dict get $tok kind] eq "word"} {
+            lappend words [dict get $tok text]
+        }
+    }
+    set words
+} -result [list set "x\uFEFFy"]
+
+# -- Positions -------------------------------------------------------------
+
+test lex-pos-1 {First token is at line 1 col 1} -body {
+    set t [tclparse::lex::scan "set x 1"]
+    set w [lindex $t 0]
+    list [dict get $w line] [dict get $w col]
+} -result {1 1}
+
+test lex-pos-2 {Newline advances line, resets column} -body {
+    set t [tclparse::lex::scan "a\nb"]
+    set w [lindex $t 2]   ;# word "b" after whitespace
+    list [dict get $w text] [dict get $w line] [dict get $w col]
+} -result {b 2 1}
+
+test lex-pos-3 {\\<nl> continuation advances line counter} -body {
+    set t [tclparse::lex::scan "a \\\nb"]
+    set last [lindex $t end]
+    list [dict get $last text] [dict get $last line]
+} -result {b 2}
+
+test lex-pos-4 {Stray \\r does not advance the line counter} -body {
+    set t [tclparse::lex::scan "a\rb"]
+    # \r is whitespace in our scanner, so "a" and "b" become separate words
+    # separated by a whitespace run; both on line 1.
+    set wa [lindex $t 0]
+    set wb [lindex $t 2]
+    list [dict get $wa line] [dict get $wb line] [dict get $wb col]
+} -result {1 1 3}
+
+# -- Empty-whitespace invariant --------------------------------------------
+
+test lex-no-empty-ws-1 {Adjacent tokens produce no empty whitespace node} -body {
+    set t [tclparse::lex::scan "a;b"]
+    foreach tok $t {
+        if {[dict get $tok kind] eq "whitespace" && [dict get $tok text] eq ""} {
+            return FAIL
+        }
+    }
+    return OK
+} -result OK
+
+# -- Recovery --------------------------------------------------------------
+
+test lex-recovery-1 {Unbalanced brace emits unknown up to blank-line boundary} -body {
+    set src "set bad \{open\nstill open\n\nafter"
+    set t [tclparse::lex::scan $src]
+    set unknowns [list]
+    foreach tok $t {
+        if {[dict get $tok kind] eq "unknown"} {
+            lappend unknowns [dict get $tok text]
+        }
+    }
+    set unknowns
+} -result [list "\{open\nstill open"]
+
+test lex-recovery-2 {After recovery, the following command parses normally} -body {
+    set src "set x \{bad\n\nset y 1"
+    set t [tclparse::lex::scan $src]
+    set kinds [list]
+    foreach tok $t { lappend kinds [dict get $tok kind] }
+    set kinds
+} -result {word whitespace word whitespace unknown whitespace word whitespace word whitespace word}
+
+test lex-recovery-3 {Unbalanced quote to EOF emits unknown covering rest of file} -body {
+    set t [tclparse::lex::scan "a \"unterminated"]
+    set last [lindex $t end]
+    list [dict get $last kind] [dict get $last text]
+} -result [list unknown "\"unterminated"]
+
+# -- Byte-identical reconstruction (lexer-level) ---------------------------
+# The lexer alone should already reconstruct input byte-for-byte for
+# well-formed fixtures. The terminator rule (implicit ";") is the only
+# reason we substitute text during reconstruction.
+
+foreach fixture {minimal.tcl empty.tcl whitespace-only.tcl comment-only.tcl
+                 mixed-quoting.tcl continuation-heavy.tcl edge-cases.tcl
+                 utf8-diacritics.tcl control-flow.tcl crlf.tcl bom.tcl} {
+    test lex-roundtrip-$fixture "Lexer reconstructs $fixture byte-identically" -body {
+        set src [load_fixture $fixture]
+        set tokens [tclparse::lex::scan $src]
+        set got [reconstruct $tokens]
+        if {$got eq $src} {
+            return OK
+        } else {
+            return "DIFF: [string length $src] bytes in, [string length $got] bytes out"
+        }
+    } -result OK
+}
+
+# -- malformed.tcl: recovery, then the tail parses normally ----------------
+
+test lex-roundtrip-malformed {Malformed fixture round-trips too — unknown preserves bytes} -body {
+    set src [load_fixture malformed.tcl]
+    set tokens [tclparse::lex::scan $src]
+    set got [reconstruct $tokens]
+    expr {$got eq $src}
+} -result 1
+
+cleanupTests

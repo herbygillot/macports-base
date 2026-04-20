@@ -9,7 +9,9 @@ TCLPKG=		cregistry \
 			pextlib1.0 \
 			portlist1.0 \
 			machista1.0 \
-			mpcommon1.0
+			mpcommon1.0 \
+			tclparse1.0 \
+			portparse1.0
 SUBDIR=		compat ${TCLPKG} port programs
 
 ifeq (@TRACEMODE_SUPPORT@,1)

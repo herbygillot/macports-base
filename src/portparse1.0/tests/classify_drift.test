@@ -1,0 +1,222 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+#
+# Classification drift. Scans src/port1.0/*.tcl with tclparse, extracts
+# every directive name registered with a string-literal argument, and
+# asserts every extracted name is present in portparse::directives OR
+# portparse::body_policy (the latter allows descent-only entries like
+# `variant`).
+#
+# Scope and known gaps:
+#   - Literal names (bare/braced/quoted) are asserted (hard failure).
+#   - commands NAME fans out to 9 suffixed directives: use_<NAME> and
+#     NAME.{dir,pre_args,args,post_args,env,nice,type,cmd}.
+#   - Dynamic names (variable-bearing, {*}$list expansion) cannot be
+#     resolved by a lexical scan. Call sites carrying a `composite` name
+#     arg are collected into a classify_drift_warnings block, reported
+#     but not asserted. The authoritative pointer for known dynamic
+#     families is the comment block at the top of directives.tcl.
+#   - NOT caught: new *members* added to an existing dynamic family
+#     (same call site, different list contents). Keeping directives.tcl
+#     synced with the contents of those lists is a manual responsibility.
+
+package require tcltest 2
+namespace import tcltest::*
+
+source [file join [file dirname [info script]] library.tcl]
+package require portparse 1.0
+package require tclparse 1.0
+
+# --------------------------------------------------------------------------
+# Scanner — matches the coverage-generation logic used to seed
+# directives.tcl. Must stay in sync with portutil.tcl's registration
+# forms. Nine-suffix fan-out for `commands` is maintained here in one
+# place; if `commands` grows a new suffix, update COMMANDS_SUFFIXES
+# alongside directives.tcl.
+# --------------------------------------------------------------------------
+
+set ::DRIFT_OPTION_FORMS {options options_export}
+set ::DRIFT_FIRST_ARG_FORMS {option_proc}
+set ::DRIFT_COMMANDS_SUFFIXES \
+    {use_ .dir .pre_args .args .post_args .env .nice .type .cmd}
+# target_provides <ditem> <target1> <target2> ...  (portutil.tcl:2256)
+# The ditem (first arg, always composite) is skipped. Each literal target
+# name fans out to three directives: the target-override body, and the
+# pre-/post- hooks.
+set ::DRIFT_TARGET_FORMS {target_provides}
+set ::DRIFT_TARGET_PREFIXES {"" pre- post-}
+
+# Scan result: dict name → list of "{file line form}".
+set ::DRIFT_FOUND [dict create]
+set ::DRIFT_DYNAMIC_CALL_SITES [list]
+set ::DRIFT_CURRENT_FILE ""
+# File-global id → {line col} dict for the file currently being
+# scanned. Computed once per file on the descended root CST so that
+# registrations inside foreach/if/switch bodies report accurate
+# file-global line numbers (not inner-CST-local ones).
+set ::DRIFT_CURRENT_POSITIONS [dict create]
+
+proc drift_line_of {n} {
+    set id [dict get $n id]
+    if {[dict exists $::DRIFT_CURRENT_POSITIONS $id]} {
+        return [lindex [dict get $::DRIFT_CURRENT_POSITIONS $id] 0]
+    }
+    return [dict get $n line]
+}
+
+proc drift_extract_literal {w} {
+    set wk [dict get $w word_kind]
+    if {$wk eq "composite"} { return "" }
+    set t [dict get $w text]
+    if {$wk eq "braced" || $wk eq "quoted"} {
+        set t [string range $t 1 end-1]
+    }
+    return $t
+}
+
+proc drift_visitor {n} {
+    if {[dict get $n kind] ne "command"} { return }
+    set name [tclparse::command_of $n]
+    set is_all    [expr {$name in $::DRIFT_OPTION_FORMS}]
+    set is_first  [expr {$name in $::DRIFT_FIRST_ARG_FORMS}]
+    set is_cmds   [expr {$name eq "commands"}]
+    set is_target [expr {$name in $::DRIFT_TARGET_FORMS}]
+    if {!$is_all && !$is_first && !$is_cmds && !$is_target} { return }
+    set words [tclparse::words_of $n]
+    set args  [lrange $words 1 end]
+
+    # For target_provides the ditem (first arg) is skipped when looking
+    # at literal names. Composite detection still considers it so that a
+    # dynamic ditem isn't mistaken for a dynamic target name.
+    if {$is_target} {
+        set name_args [lrange $args 1 end]
+    } elseif {$is_first} {
+        set name_args [lrange $args 0 0]
+    } else {
+        set name_args $args
+    }
+
+    # Detect dynamic (composite) name args on the set of words that
+    # contribute directive names.
+    set saw_composite 0
+    foreach w $name_args {
+        if {[dict get $w word_kind] eq "composite"} { set saw_composite 1 }
+    }
+    if {$saw_composite} {
+        lappend ::DRIFT_DYNAMIC_CALL_SITES \
+            [list $::DRIFT_CURRENT_FILE $name [drift_line_of $n]]
+    }
+
+    set literals [list]
+    foreach w $name_args {
+        set lit [drift_extract_literal $w]
+        if {$lit eq "" || $lit eq "*"} { continue }
+        lappend literals $lit
+    }
+
+    if {$is_cmds} {
+        foreach lit $literals {
+            foreach suf $::DRIFT_COMMANDS_SUFFIXES {
+                if {$suf eq "use_"} {
+                    set d "use_${lit}"
+                } else {
+                    set d "${lit}${suf}"
+                }
+                dict lappend ::DRIFT_FOUND $d \
+                    [list $::DRIFT_CURRENT_FILE [drift_line_of $n] $name]
+            }
+        }
+    } elseif {$is_target} {
+        foreach lit $literals {
+            foreach pre $::DRIFT_TARGET_PREFIXES {
+                dict lappend ::DRIFT_FOUND "${pre}${lit}" \
+                    [list $::DRIFT_CURRENT_FILE [drift_line_of $n] $name]
+            }
+        }
+    } else {
+        foreach lit $literals {
+            dict lappend ::DRIFT_FOUND $lit \
+                [list $::DRIFT_CURRENT_FILE [drift_line_of $n] $name]
+        }
+    }
+}
+
+# Locate src/port1.0/ from src/portparse1.0/tests/.
+set _tests_dir   [file dirname [file normalize [info script]]]
+set _portparse   [file dirname $_tests_dir]
+set _src_dir     [file dirname $_portparse]
+set ::DRIFT_PORT10_DIR [file join $_src_dir port1.0]
+
+test classify-drift-runs {scanner runs on every .tcl file in port1.0} -setup {
+    set ::DRIFT_FOUND [dict create]
+    set ::DRIFT_DYNAMIC_CALL_SITES [list]
+} -body {
+    set files [lsort [glob -directory $::DRIFT_PORT10_DIR *.tcl]]
+    expr {[llength $files] >= 10}
+} -result 1
+
+test classify-drift-coverage \
+    {every literal-name registration is present in directives or body_policy} \
+    -body {
+        set files [lsort [glob -directory $::DRIFT_PORT10_DIR *.tcl]]
+        foreach f $files {
+            set chan [open $f r]
+            chan configure $chan -encoding utf-8 -profile strict
+            set text [read $chan]
+            close $chan
+            set ::DRIFT_CURRENT_FILE [file tail $f]
+            set cst [tclparse::parse $text]
+            # Descend Tcl control-flow so registrations nested in
+            # foreach/if/while bodies are visible to the walk. Without
+            # this step, dynamic-family registrations inside a foreach
+            # (e.g. configure.${tool}_archflags in portconfigure.tcl)
+            # would be entirely invisible to the drift scanner.
+            set cst [tclparse::descend $cst [tclparse::default_policy]]
+            # Precompute file-global positions for every reachable
+            # node. Without this, `dict get $n line` on commands inside
+            # a descended body reports an inner-CST-local line number,
+            # so failure/warning messages would point maintainers at
+            # line 2 instead of the real registration site.
+            set ::DRIFT_CURRENT_POSITIONS [tclparse::positions_of $cst]
+            tclparse::walk $cst drift_visitor
+        }
+        set directives [portparse::directives]
+        set policy     [portparse::body_policy]
+        set missing    [list]
+        dict for {name sources} $::DRIFT_FOUND {
+            if {[dict exists $directives $name]} continue
+            if {[dict exists $policy $name]} continue
+            # Precise failure message: where the directive is registered.
+            set src [lindex $sources 0]
+            lassign $src fname line form
+            lappend missing \
+                "classify_drift: directive '$name' registered in $fname:$line via '$form'\n  is not present in portparse::directives or portparse::body_policy\n  -> add an entry to src/portparse1.0/directives.tcl"
+        }
+        if {[llength $missing] > 0} {
+            return [join $missing "\n\n"]
+        }
+        return "ok"
+    } -result "ok"
+
+# --------------------------------------------------------------------------
+# classify_drift_warnings — informational, not a failure. Lists every
+# registration call site whose name arguments include a composite
+# (variable- or substitution-bearing) word. A new entry here means a
+# new dynamic *pattern* has been added; reviewers should decide whether
+# to add a corresponding entry (or entries) to directives.tcl and the
+# dynamic-families comment block at the top of directives.tcl.
+# --------------------------------------------------------------------------
+
+test classify-drift-warnings {enumerate dynamic call sites (informational)} -body {
+    set uniq [lsort -unique $::DRIFT_DYNAMIC_CALL_SITES]
+    set out [list "classify_drift_warnings: [llength $uniq] dynamic call site(s) found"]
+    foreach entry $uniq {
+        lassign $entry fname form line
+        lappend out "  $fname:$line  $form <...composite name arg...>"
+    }
+    # Always return ok; this test exists to surface the dynamic list,
+    # not to fail on it.
+    puts stderr "\n[join $out \n]\n"
+    set _ ok
+} -result ok
+
+cleanupTests

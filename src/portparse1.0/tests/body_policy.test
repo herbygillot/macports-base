@@ -1,0 +1,142 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+#
+# body_policy composition and descent outcomes. Pins:
+#   - body_policy includes every tclparse::default_policy entry
+#   - MacPorts body directives descend
+#   - directives with braced-list args (depends_*, checksums, ...) are NOT
+#     in the policy (their braces are data, not Tcl code)
+#   - portparse::parse round-trips byte-identically via tclparse::emit
+
+package require tcltest 2
+namespace import tcltest::*
+
+source [file join [file dirname [info script]] library.tcl]
+package require portparse 1.0
+
+# -- inheritance from tclparse::default_policy -----------------------------
+
+test inherits-default-policy {body_policy contains every default-policy entry} -body {
+    set default [tclparse::default_policy]
+    set body    [portparse::body_policy]
+    set missing [list]
+    dict for {k _} $default {
+        if {![dict exists $body $k]} { lappend missing $k }
+    }
+    set missing
+} -result {}
+
+test inherits-default-shapes {default-policy entries survive unchanged} -body {
+    set default [tclparse::default_policy]
+    set body    [portparse::body_policy]
+    set mismatches [list]
+    dict for {k v} $default {
+        if {[dict get $body $k] ne $v} { lappend mismatches $k }
+    }
+    set mismatches
+} -result {}
+
+# -- MacPorts body entries -------------------------------------------------
+
+test has-body-containers {variant, subport, platform each descend their last arg} -body {
+    set p [portparse::body_policy]
+    list \
+        [dict get $p variant] \
+        [dict get $p subport] \
+        [dict get $p platform]
+} -result [list {positions last} {positions last} {positions last}]
+
+test has-phase-overrides {configure/build/destroot/test descend their last arg} -body {
+    set p [portparse::body_policy]
+    set r [list]
+    foreach cmd {configure build destroot test} {
+        lappend r [dict get $p $cmd]
+    }
+    set r
+} -result [list {positions last} {positions last} {positions last} {positions last}]
+
+test has-all-phase-hooks {pre-/post- for every pipeline phase is present} -body {
+    set p [portparse::body_policy]
+    set phases {fetch checksum extract patch configure build destroot
+                test install activate deactivate uninstall}
+    set missing [list]
+    foreach ph $phases {
+        foreach prefix {pre- post-} {
+            set k "${prefix}${ph}"
+            if {![dict exists $p $k]} { lappend missing $k }
+        }
+    }
+    set missing
+} -result {}
+
+# -- data directives are EXCLUDED ------------------------------------------
+
+test excludes-data-directives {braced-list directives are not in the policy} -body {
+    set p [portparse::body_policy]
+    set data_directives {
+        depends_lib depends_build depends_run depends_test
+        depends_fetch depends_extract depends_patch
+        master_sites distfiles checksums patchfiles patch_sites
+        license categories maintainers platforms supported_archs
+    }
+    set accidentally_in [list]
+    foreach d $data_directives {
+        if {[dict exists $p $d]} { lappend accidentally_in $d }
+    }
+    set accidentally_in
+} -result {}
+
+# -- mutation safety -------------------------------------------------------
+
+test body-policy-fresh-copy {body_policy returns a fresh dict each call} -body {
+    set a [portparse::body_policy]
+    dict set a zzjunk {positions 1}
+    set b [portparse::body_policy]
+    dict exists $b zzjunk
+} -result 0
+
+# -- descent outcomes via portparse::parse --------------------------------
+
+test parse-variant-body {variant body is descended to an inner CST} -body {
+    set src [load_fixture nested-variants.Portfile]
+    set cst [portparse::parse $src]
+    set variants [tclparse::find $cst -name variant]
+    expr {[llength $variants] > 0}
+} -result 1
+
+test parse-variant-contains-nested {inner variant CST can itself be queried} -body {
+    set src [load_fixture nested-variants.Portfile]
+    set cst [portparse::parse $src]
+    # Top-level find reaches nested variants, too.
+    set variants [tclparse::find $cst -name variant]
+    # At least the two ssl / python27 variants plus the inner python27_extras.
+    expr {[llength $variants] >= 3}
+} -result 1
+
+test parse-phase-body-descended {phase-override body is descended} -body {
+    set src [load_fixture phase-bodies.Portfile]
+    set cst [portparse::parse $src]
+    set systems [tclparse::find $cst -name system]
+    # There are system calls inside every descended phase body.
+    expr {[llength $systems] > 0}
+} -result 1
+
+test parse-control-flow-in-variant {directives nested inside if+variant are reachable} -body {
+    set src [load_fixture control-flow-portfile.Portfile]
+    set cst [portparse::parse $src]
+    # find must descend into variant body AND into the if inside it.
+    set deps [tclparse::find $cst -name depends_lib-append]
+    expr {[llength $deps] >= 4}
+} -result 1
+
+# -- byte-identical round-trip through portparse::parse --------------------
+
+foreach fixture {minimal.Portfile site-tags.Portfile phase-bodies.Portfile
+                 nested-variants.Portfile control-flow-portfile.Portfile
+                 modeline.Portfile utf8.Portfile} {
+    test rt-parse-$fixture "emit(portparse::parse($fixture)) == src" -body {
+        set src [load_fixture $fixture]
+        expr {[tclparse::emit [portparse::parse $src]] eq $src}
+    } -result 1
+}
+
+cleanupTests

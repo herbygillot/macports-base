@@ -1,0 +1,24 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+#
+# Byte-identical round-trip. The lossless contract is: for any CST
+# produced by parse (or parse+descend), emit reconstructs the source.
+# Descent tests live in descend.test — this file pins the parse-only
+# baseline across every fixture.
+
+package require tcltest 2
+namespace import tcltest::*
+
+source [file join [file dirname [info script]] library.tcl]
+package require tclparse 1.0
+
+foreach fixture {minimal.tcl empty.tcl whitespace-only.tcl comment-only.tcl
+                 mixed-quoting.tcl continuation-heavy.tcl edge-cases.tcl
+                 utf8-diacritics.tcl control-flow.tcl crlf.tcl bom.tcl
+                 malformed.tcl} {
+    test rt-parse-$fixture "emit(parse($fixture)) == src" -body {
+        set src [load_fixture $fixture]
+        expr {[tclparse::emit [tclparse::parse $src]] eq $src}
+    } -result 1
+}
+
+cleanupTests

@@ -608,6 +608,8 @@ AC_CONFIG_FILES([
 	src/port1.0/port_autoconf.tcl
 	src/port1.0/port_test_autoconf.tcl
 	src/portlist1.0/Makefile
+	src/portparse1.0/Makefile
+	src/tclparse1.0/Makefile
 	src/programs/Makefile
 	src/registry2.0/Makefile
 	src/registry2.0/registry_autoconf.tcl

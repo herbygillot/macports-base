@@ -1,0 +1,209 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+#
+# Traversal tests: emit, walk, walk_with_path, find, command_of,
+# structural, words_of, blank_line_count, position_of, positions_of.
+
+package require tcltest 2
+namespace import tcltest::*
+
+source [file join [file dirname [info script]] library.tcl]
+package require tclparse 1.0
+
+# Visitor that records node kinds into a session-scoped list.
+proc record_kind {n} {
+    global visited_kinds
+    lappend visited_kinds [dict get $n kind]
+}
+
+proc record_with_path {n ancestors} {
+    global visited_with_path
+    set names [list]
+    foreach a $ancestors { lappend names [tclparse::command_of $a] }
+    lappend visited_with_path [list [dict get $n kind] $names]
+}
+
+# -- emit: byte-identical round-trip on every fixture ----------------------
+
+foreach fixture {minimal.tcl empty.tcl whitespace-only.tcl comment-only.tcl
+                 mixed-quoting.tcl continuation-heavy.tcl edge-cases.tcl
+                 utf8-diacritics.tcl control-flow.tcl crlf.tcl bom.tcl
+                 malformed.tcl} {
+    test emit-roundtrip-$fixture "emit(parse($fixture)) is byte-identical" -body {
+        set src [load_fixture $fixture]
+        set cst [tclparse::parse $src]
+        expr {[tclparse::emit $cst] eq $src}
+    } -result 1
+}
+
+# -- walk: visits every node in order --------------------------------------
+
+test walk-ordering {walk reaches every top node plus every body node} -body {
+    set cst [tclparse::parse "a b\nc"]
+    set ::visited_kinds [list]
+    tclparse::walk $cst record_kind
+    set ::visited_kinds
+} -result {command word whitespace word whitespace command word}
+
+test walk-command-body {walk descends into command body} -body {
+    set cst [tclparse::parse "set x 1"]
+    set ::visited_kinds [list]
+    tclparse::walk $cst record_kind
+    set ::visited_kinds
+} -result {command word whitespace word whitespace word}
+
+# -- walk_with_path: ancestors chain ---------------------------------------
+
+test walk-path-root-empty {Top-level node visits receive an empty ancestor chain} -body {
+    set cst [tclparse::parse "set x 1"]
+    set ::visited_with_path [list]
+    tclparse::walk_with_path $cst record_with_path
+    # The first entry must be the top-level command with no ancestors.
+    lindex $::visited_with_path 0
+} -result {command {}}
+
+test walk-path-body-one {Body-node visit lists the enclosing command as ancestor} -body {
+    set cst [tclparse::parse "set x 1"]
+    set ::visited_with_path [list]
+    tclparse::walk_with_path $cst record_with_path
+    # The second entry is the first word, whose ancestor chain is [set].
+    lindex $::visited_with_path 1
+} -result {word set}
+
+# -- find, command_of ------------------------------------------------------
+
+test find-by-name {find returns commands whose first word matches} -body {
+    set cst [tclparse::parse "set x 1\nset y 2\nputs hi"]
+    llength [tclparse::find $cst -name set]
+} -result 2
+
+test find-no-match {find returns empty list when no match} -body {
+    set cst [tclparse::parse "set x 1"]
+    tclparse::find $cst -name nonexistent
+} -result {}
+
+test find-bad-args {find requires -name <value>} -body {
+    set cst [tclparse::parse "a"]
+    catch {tclparse::find $cst} err opts
+    dict get $opts -errorcode
+} -result {TCLPARSE BADARGS}
+
+test command-of-command {command_of returns first word text} -body {
+    set cst [tclparse::parse "set x 1"]
+    tclparse::command_of [lindex [dict get $cst nodes] 0]
+} -result set
+
+test command-of-noncommand {command_of returns empty for non-command} -body {
+    set cst [tclparse::parse "set x 1\n"]
+    # lindex 1 is the trailing whitespace node.
+    tclparse::command_of [lindex [dict get $cst nodes] 1]
+} -result {}
+
+# -- structural ------------------------------------------------------------
+
+test structural-filters-ws {structural drops whitespace only} -body {
+    set cst [tclparse::parse "# hi\nset x 1;set y 2\n"]
+    set kinds [list]
+    foreach n [tclparse::structural $cst] {
+        lappend kinds [dict get $n kind]
+    }
+    set kinds
+} -result {comment command terminator command}
+
+# -- words_of --------------------------------------------------------------
+
+test words-of-1 {words_of drops whitespace and unknown, keeps word} -body {
+    set cst [tclparse::parse "set x 1"]
+    set cmd [lindex [dict get $cst nodes] 0]
+    set texts [list]
+    foreach w [tclparse::words_of $cmd] { lappend texts [dict get $w text] }
+    set texts
+} -result {set x 1}
+
+test words-of-error {words_of throws on non-command node} -body {
+    set cst [tclparse::parse "set x 1\n"]
+    set ws [lindex [dict get $cst nodes] 1]
+    catch {tclparse::words_of $ws} err opts
+    dict get $opts -errorcode
+} -result {TCLPARSE NOT_COMMAND}
+
+# -- blank_line_count ------------------------------------------------------
+
+test blank-lines-single-nl {single newline means zero blank lines} -body {
+    set cst [tclparse::parse "a\nb"]
+    set ws [lindex [dict get $cst nodes] 1]
+    tclparse::blank_line_count $ws
+} -result 0
+
+test blank-lines-two-nl {two newlines = one blank line} -body {
+    set cst [tclparse::parse "a\n\nb"]
+    set ws [lindex [dict get $cst nodes] 1]
+    tclparse::blank_line_count $ws
+} -result 1
+
+test blank-lines-three-nl {three newlines = two blank lines} -body {
+    set cst [tclparse::parse "a\n\n\nb"]
+    set ws [lindex [dict get $cst nodes] 1]
+    tclparse::blank_line_count $ws
+} -result 2
+
+test blank-lines-error {blank_line_count throws on non-whitespace node} -body {
+    set cst [tclparse::parse "set x 1"]
+    set cmd [lindex [dict get $cst nodes] 0]
+    catch {tclparse::blank_line_count $cmd} err opts
+    dict get $opts -errorcode
+} -result {TCLPARSE NOT_WHITESPACE}
+
+# -- position_of, positions_of ---------------------------------------------
+
+test pos-first-node {first token is {1 1}} -body {
+    set cst [tclparse::parse "set x 1"]
+    set first [lindex [dict get [lindex [dict get $cst nodes] 0] body] 0]
+    tclparse::position_of $cst [dict get $first id]
+} -result {1 1}
+
+test pos-second-line {a word after a newline reports line 2} -body {
+    set cst [tclparse::parse "a\nbcd"]
+    set cmd2 [lindex [dict get $cst nodes] 2]
+    set w [lindex [dict get $cmd2 body] 0]
+    tclparse::position_of $cst [dict get $w id]
+} -result {2 1}
+
+test pos-crlf {\r does not advance the line counter} -body {
+    set src [load_fixture crlf.tcl]
+    set cst [tclparse::parse $src]
+    # Find the command "puts"; it starts line 3 col 1 under our rules.
+    set puts_cmd [lindex [tclparse::find $cst -name puts] 0]
+    set first [lindex [dict get $puts_cmd body] 0]
+    tclparse::position_of $cst [dict get $first id]
+} -result {3 1}
+
+test pos-bom-col {BOM is col 1; char after BOM is col 2} -body {
+    set src [load_fixture bom.tcl]
+    set cst [tclparse::parse $src]
+    set first [lindex [dict get $cst nodes] 0]
+    set second [lindex [dict get $cst nodes] 1]
+    list \
+        [tclparse::position_of $cst [dict get $first id]] \
+        [tclparse::position_of $cst [dict get [lindex [dict get $second body] 0] id]]
+} -result {{1 1} {1 2}}
+
+test pos-not-found {position_of throws on unreachable id} -body {
+    set cst [tclparse::parse "a"]
+    catch {tclparse::position_of $cst 99999} err opts
+    dict get $opts -errorcode
+} -result {TCLPARSE NOT_FOUND}
+
+test positions-of-consistency {positions_of agrees with position_of for every id} -body {
+    set cst [tclparse::parse "set x 1\nputs hello\n# comment\n"]
+    set dict_positions [tclparse::positions_of $cst]
+    set ok 1
+    dict for {id pos} $dict_positions {
+        if {[tclparse::position_of $cst $id] ne $pos} {
+            set ok 0
+            break
+        }
+    }
+    set ok
+} -result 1
+
+cleanupTests

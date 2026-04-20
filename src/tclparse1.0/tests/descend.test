@@ -1,0 +1,421 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+#
+# Descent mechanism + default policy. Pins:
+#   - declarative positions (integers and "last")
+#   - shape-mismatch silent no-ops
+#   - empty braced body → empty inner
+#   - if_bodies descends every script arg across elseif/else
+#   - switch_bodies descends only individual-args form; list-form stays opaque
+#   - default_policy accessor returns fresh copies
+#   - global ID uniqueness across the entire tree after descent
+#   - emit(descend(parse(x), policy)) == emit(parse(x)) byte-identical
+#   - custom policy composition via dict merge
+
+package require tcltest 2
+namespace import tcltest::*
+
+source [file join [file dirname [info script]] library.tcl]
+package require tclparse 1.0
+
+# --- helpers ---------------------------------------------------------------
+
+proc collect_ids_cst {cst idsVar} {
+    upvar 1 $idsVar ids
+    foreach n [dict get $cst nodes] {
+        collect_ids_node $n ids
+    }
+}
+
+proc collect_ids_node {n idsVar} {
+    upvar 1 $idsVar ids
+    lappend ids [dict get $n id]
+    set kind [dict get $n kind]
+    if {$kind eq "command"} {
+        foreach bn [dict get $n body] { collect_ids_node $bn ids }
+    } elseif {$kind eq "word" && [dict exists $n inner]} {
+        collect_ids_cst [dict get $n inner] ids
+    }
+}
+
+proc count_nodes_cst {cst} {
+    set c 0
+    foreach n [dict get $cst nodes] { incr c [count_nodes_node $n] }
+    return $c
+}
+proc count_nodes_node {n} {
+    set c 1
+    set kind [dict get $n kind]
+    if {$kind eq "command"} {
+        foreach bn [dict get $n body] { incr c [count_nodes_node $bn] }
+    } elseif {$kind eq "word" && [dict exists $n inner]} {
+        incr c [count_nodes_cst [dict get $n inner]]
+    }
+    return $c
+}
+
+# Return the first command with the given name at the top level of cst.
+proc top_cmd {cst name} {
+    foreach n [dict get $cst nodes] {
+        if {[dict get $n kind] eq "command" && [tclparse::command_of $n] eq $name} {
+            return $n
+        }
+    }
+    return ""
+}
+
+# Return the word node at argument index $i (1-based; arg 1 is the word
+# after the command name) of a command node.
+proc arg_word {cmd i} {
+    set words [tclparse::words_of $cmd]
+    return [lindex $words $i]
+}
+
+# --- default_policy accessor ----------------------------------------------
+
+test policy-default-keys {default_policy exposes the declared control-flow commands} -body {
+    set p [tclparse::default_policy]
+    lsort [dict keys $p]
+} -result {for foreach if switch while}
+
+test policy-default-fresh-copy {default_policy returns a fresh dict each call} -body {
+    set a [tclparse::default_policy]
+    dict set a mycmd {positions last}
+    set b [tclparse::default_policy]
+    dict exists $b mycmd
+} -result 0
+
+test policy-default-entries {shapes match the plan} -body {
+    set p [tclparse::default_policy]
+    list \
+        [dict get $p foreach] \
+        [dict get $p while] \
+        [dict get $p for] \
+        [dict get $p if] \
+        [dict get $p switch]
+} -result [list \
+    {positions last} \
+    {positions 2} \
+    {positions {1 3 4}} \
+    {handler tclparse::cst::if_bodies} \
+    {handler tclparse::cst::switch_bodies}]
+
+# --- declarative positions ------------------------------------------------
+
+test positions-foreach-last {foreach's last arg is descended into a CST} -body {
+    set cst [tclparse::parse "foreach x {1 2 3} { puts \$x }"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst foreach]
+    set body_word [arg_word $cmd 3]
+    list [dict exists $body_word inner] [dict exists $body_word text]
+} -result {1 0}
+
+test positions-while-2 {while descends arg 2 (body), not arg 1 (cond)} -body {
+    set cst [tclparse::parse "while {\$i < 10} { incr i }"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst while]
+    set cond [arg_word $cmd 1]
+    set body [arg_word $cmd 2]
+    list [dict exists $cond inner] [dict exists $body inner]
+} -result {0 1}
+
+test positions-for-1-3-4 {for descends args 1, 3, 4 but not arg 2 (cond)} -body {
+    set cst [tclparse::parse "for {set i 0} {\$i < 10} {incr i} { puts \$i }"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst for]
+    set r [list]
+    foreach i {1 2 3 4} {
+        lappend r [dict exists [arg_word $cmd $i] inner]
+    }
+    set r
+} -result {1 0 1 1}
+
+test positions-shape-mismatch-bare {bare arg at a declared position is silently skipped} -body {
+    set cst [tclparse::parse "foreach x mylist body"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst foreach]
+    # arg 3 is the bare word "body" — no inner, no error.
+    set w [arg_word $cmd 3]
+    list [dict exists $w inner] [dict get $w text]
+} -result {0 body}
+
+test positions-shape-mismatch-quoted {quoted arg at a declared position is silently skipped} -body {
+    set cst [tclparse::parse "foreach x {1 2} \"body\""]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst foreach]
+    dict exists [arg_word $cmd 3] inner
+} -result 0
+
+test positions-empty-body {empty braced body descends to an empty inner} -body {
+    set cst [tclparse::parse "foreach x {1 2} {}"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst foreach]
+    set w [arg_word $cmd 3]
+    list [dict exists $w inner] [llength [dict get [dict get $w inner] nodes]]
+} -result {1 0}
+
+test positions-too-few-args {missing arg position silently skips} -body {
+    set cst [tclparse::parse "foreach"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    # No crash; the command round-trips.
+    expr {[tclparse::emit $cst] eq "foreach"}
+} -result 1
+
+# --- if_bodies handler ----------------------------------------------------
+
+test if-basic-then-else {if/else descends both bodies} -body {
+    set cst [tclparse::parse "if {\$x == 1} { puts one } else { puts other }"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst if]
+    # arg 1 is cond, arg 2 is then-body, arg 3 is "else", arg 4 is else-body.
+    list \
+        [dict exists [arg_word $cmd 1] inner] \
+        [dict exists [arg_word $cmd 2] inner] \
+        [dict exists [arg_word $cmd 4] inner]
+} -result {0 1 1}
+
+test if-elseif-chain {elseif chain: every body descended, conds left alone} -body {
+    set src [load_fixture control-flow.tcl]
+    set cst [tclparse::parse $src]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst if]
+    # if {C1} {B1} elseif {C2} {B2} else {B3}
+    # args:       1   2    3      4   5    6    7
+    list \
+        [dict exists [arg_word $cmd 1] inner] \
+        [dict exists [arg_word $cmd 2] inner] \
+        [dict exists [arg_word $cmd 3] inner] \
+        [dict exists [arg_word $cmd 4] inner] \
+        [dict exists [arg_word $cmd 5] inner] \
+        [dict exists [arg_word $cmd 6] inner] \
+        [dict exists [arg_word $cmd 7] inner]
+} -result {0 1 0 0 1 0 1}
+
+test if-then-keyword {optional "then" keyword is skipped} -body {
+    set cst [tclparse::parse "if {\$x} then { puts yes }"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst if]
+    # arg 2 is bare "then"; arg 3 is the body.
+    list \
+        [dict exists [arg_word $cmd 2] inner] \
+        [dict get [arg_word $cmd 2] text] \
+        [dict exists [arg_word $cmd 3] inner]
+} -result {0 then 1}
+
+# --- switch_bodies handler ------------------------------------------------
+
+test switch-individual-form {switch individual-args form descends each body} -body {
+    set cst [tclparse::parse "switch \$mode a { puts A } b { puts B } default { puts D }"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst switch]
+    # args: 1=$mode, 2=a, 3={...}, 4=b, 5={...}, 6=default, 7={...}
+    list \
+        [dict exists [arg_word $cmd 1] inner] \
+        [dict exists [arg_word $cmd 2] inner] \
+        [dict exists [arg_word $cmd 3] inner] \
+        [dict exists [arg_word $cmd 4] inner] \
+        [dict exists [arg_word $cmd 5] inner] \
+        [dict exists [arg_word $cmd 6] inner] \
+        [dict exists [arg_word $cmd 7] inner]
+} -result {0 0 1 0 1 0 1}
+
+test switch-list-form-opaque {switch list-form single braced arg stays opaque} -body {
+    set src "switch \$mode {\n    a { puts A }\n    b { puts B }\n}"
+    set cst [tclparse::parse $src]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst switch]
+    set w [arg_word $cmd 2]
+    # Braced, well-formed, NOT descended — text present, no inner.
+    list \
+        [dict get $w word_kind] \
+        [dict exists $w text] \
+        [dict exists $w inner]
+} -result {braced 1 0}
+
+test switch-options-skipped {leading -exact style options are skipped} -body {
+    set cst [tclparse::parse "switch -exact -- \$m a {puts A} b {puts B}"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst switch]
+    # args: 1=-exact, 2=--, 3=$m (value), 4=a, 5={puts A}, 6=b, 7={puts B}
+    list \
+        [dict exists [arg_word $cmd 5] inner] \
+        [dict exists [arg_word $cmd 7] inner] \
+        [dict exists [arg_word $cmd 4] inner]
+} -result {1 1 0}
+
+test switch-matchvar-consumes-operand {-matchvar skips its operand word} -body {
+    # Regression: option parser previously stopped consuming after the
+    # option name, leaving the matchvar variable treated as the switch
+    # value and the real value treated as the first pattern. Bodies did
+    # not get `inner`.
+    set cst [tclparse::parse "switch -matchvar mv \$mode a {puts A} b {puts B}"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst switch]
+    # args: 1=-matchvar, 2=mv, 3=$mode, 4=a, 5={puts A}, 6=b, 7={puts B}
+    list \
+        [dict exists [arg_word $cmd 5] inner] \
+        [dict exists [arg_word $cmd 7] inner]
+} -result {1 1}
+
+test switch-indexvar-consumes-operand {-indexvar skips its operand word} -body {
+    set cst [tclparse::parse "switch -regexp -indexvar iv \$mode {a.*} {puts A} {b.*} {puts B}"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cmd [top_cmd $cst switch]
+    # args: 1=-regexp, 2=-indexvar, 3=iv, 4=$mode, 5={a.*}, 6={puts A}, 7={b.*}, 8={puts B}
+    list \
+        [dict exists [arg_word $cmd 6] inner] \
+        [dict exists [arg_word $cmd 8] inner]
+} -result {1 1}
+
+# --- global ID uniqueness -------------------------------------------------
+
+test ids-unique-control-flow-fixture {descent preserves global id uniqueness across the tree} -body {
+    set src [load_fixture control-flow.tcl]
+    set cst [tclparse::parse $src]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set ids [list]
+    collect_ids_cst $cst ids
+    expr {[llength $ids] == [llength [lsort -unique -integer $ids]]}
+} -result 1
+
+test ids-unique-matches-count {total node count equals unique-id count} -body {
+    set src [load_fixture control-flow.tcl]
+    set cst [tclparse::parse $src]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set ids [list]
+    collect_ids_cst $cst ids
+    expr {[llength $ids] == [count_nodes_cst $cst]}
+} -result 1
+
+test ids-preserved-across-descend {existing ids are unchanged by descend} -body {
+    set cst [tclparse::parse "foreach x {1 2} { puts \$x }"]
+    set before [list]
+    collect_ids_cst $cst before
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set after_ids [list]
+    collect_ids_cst $cst after_ids
+    # Every id in `before` must be present in `after_ids`.
+    set ok 1
+    foreach id $before {
+        if {[lsearch -exact -integer $after_ids $id] < 0} { set ok 0; break }
+    }
+    set ok
+} -result 1
+
+# --- emit round-trip through descent --------------------------------------
+
+foreach fixture {minimal.tcl empty.tcl whitespace-only.tcl comment-only.tcl
+                 mixed-quoting.tcl continuation-heavy.tcl edge-cases.tcl
+                 utf8-diacritics.tcl control-flow.tcl crlf.tcl bom.tcl
+                 malformed.tcl} {
+    test rt-descend-$fixture "emit(descend(parse($fixture), default_policy)) == src" -body {
+        set src [load_fixture $fixture]
+        set cst [tclparse::parse $src]
+        set cst [tclparse::descend $cst [tclparse::default_policy]]
+        expr {[tclparse::emit $cst] eq $src}
+    } -result 1
+}
+
+# --- custom policy composition --------------------------------------------
+
+test custom-policy-merge {dict merge composes a custom policy onto default_policy} -body {
+    set p [dict merge [tclparse::default_policy] {mycmd {positions last}}]
+    set cst [tclparse::parse "mycmd a { puts hi }"]
+    set cst [tclparse::descend $cst $p]
+    set cmd [top_cmd $cst mycmd]
+    dict exists [arg_word $cmd 2] inner
+} -result 1
+
+test custom-policy-only {a minimal custom policy (no tcl control-flow) still works} -body {
+    set p {mycmd {positions 1}}
+    set cst [tclparse::parse "mycmd { puts yo }"]
+    set cst [tclparse::descend $cst $p]
+    set cmd [top_cmd $cst mycmd]
+    dict exists [arg_word $cmd 1] inner
+} -result 1
+
+test custom-handler {custom handler pair contract works} -body {
+    # Test handler returns {arg-index inner-cst} pairs directly.
+    proc my_handler {cmd policy} {
+        set words [tclparse::words_of $cmd]
+        set pairs [list]
+        set i 1
+        foreach w [lrange $words 1 end] {
+            if {[dict get $w word_kind] eq "braced"} {
+                set t [dict get $w text]
+                set inner [tclparse::parse [string range $t 1 end-1]]
+                lappend pairs [list $i $inner]
+            }
+            incr i
+        }
+        return $pairs
+    }
+    set p {mycmd {handler my_handler}}
+    set cst [tclparse::parse "mycmd {puts a} bare {puts b}"]
+    set cst [tclparse::descend $cst $p]
+    set cmd [top_cmd $cst mycmd]
+    list \
+        [dict exists [arg_word $cmd 1] inner] \
+        [dict exists [arg_word $cmd 2] inner] \
+        [dict exists [arg_word $cmd 3] inner]
+} -result {1 0 1}
+
+# --- re-descent with a richer policy preserves prior work -----------------
+
+test redescend-preserves-inner {inner from a prior descend survives re-descent} -body {
+    set cst [tclparse::parse "foreach x {1 2} { puts \$x }"]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set before_cmd [top_cmd $cst foreach]
+    set before_inner [dict get [arg_word $before_cmd 3] inner]
+    # Re-descend with a richer policy.
+    set p [dict merge [tclparse::default_policy] {mycmd {positions last}}]
+    set cst2 [tclparse::descend $cst $p]
+    set after_cmd [top_cmd $cst2 foreach]
+    set after_inner [dict get [arg_word $after_cmd 3] inner]
+    expr {[tclparse::emit $before_inner] eq [tclparse::emit $after_inner]}
+} -result 1
+
+test redescend-if-idempotent {re-running descend on an if tree does not throw} -body {
+    # Regression: body words have only `inner` (no `text`) after one
+    # pass; handlers must tolerate that. Previously threw TCL LOOKUP
+    # DICT text when re-descending a previously-descended `if`.
+    set src "if {\$x} { puts a } elseif {\$y} { puts b } else { puts c }"
+    set cst [tclparse::parse $src]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    set cst [tclparse::descend $cst [tclparse::default_policy]]
+    expr {[tclparse::emit $cst] eq $src}
+} -result 1
+
+test handler-threads-composed-policy {handlers recurse with caller's policy, not default_policy} -body {
+    # Regression: _policy_inner_of / if_bodies / switch_bodies must
+    # receive and forward the caller's policy. If they fall back to
+    # default_policy, a custom directive inside `if { ... }` is not
+    # descended.
+    set src "if {\$x} { mycmd { nested } }"
+    set cst [tclparse::parse $src]
+    set p [dict merge [tclparse::default_policy] {mycmd {positions last}}]
+    set cst [tclparse::descend $cst $p]
+    # Reach the mycmd command inside the if body and confirm its last
+    # arg got descended (has inner).
+    set if_cmd [top_cmd $cst if]
+    # Walk into the if's body: the braced body word has inner with a
+    # single mycmd command whose last arg should also have inner.
+    set body_word ""
+    foreach bn [dict get $if_cmd body] {
+        if {[dict get $bn kind] eq "word" && [dict exists $bn inner]} {
+            set body_word $bn
+            break
+        }
+    }
+    set found_mycmd ""
+    foreach n [dict get [dict get $body_word inner] nodes] {
+        if {[dict get $n kind] eq "command"
+            && [tclparse::command_of $n] eq "mycmd"} {
+            set found_mycmd $n
+            break
+        }
+    }
+    set last_arg [arg_word $found_mycmd 1]
+    dict exists $last_arg inner
+} -result 1
+
+cleanupTests

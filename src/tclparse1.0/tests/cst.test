@@ -1,0 +1,258 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+#
+# CST construction tests. Exercises tclparse::parse and the static-data
+# accessors tclparse::node_kinds / tclparse::word_kinds. Internal builders
+# in tclparse::cst:: are exercised only indirectly.
+
+package require tcltest 2
+namespace import tcltest::*
+
+source [file join [file dirname [info script]] library.tcl]
+package require tclparse 1.0
+
+# -- Helpers ---------------------------------------------------------------
+
+# List the top-level node kinds, in order.
+proc top_kinds {cst} {
+    set out [list]
+    foreach n [dict get $cst nodes] { lappend out [dict get $n kind] }
+    return $out
+}
+
+# List the kinds inside a command's body, in order.
+proc body_kinds {cmd} {
+    set out [list]
+    foreach n [dict get $cmd body] { lappend out [dict get $n kind] }
+    return $out
+}
+
+# Walk every node in a CST (top + bodies) and return the flat list.
+proc flatten {cst} {
+    set out [list]
+    foreach n [dict get $cst nodes] {
+        lappend out $n
+        if {[dict get $n kind] eq "command"} {
+            foreach bn [dict get $n body] { lappend out $bn }
+        }
+    }
+    return $out
+}
+
+# -- Accessor procs --------------------------------------------------------
+
+test cst-nodekinds-1 {node_kinds returns the documented list} -body {
+    tclparse::node_kinds
+} -result {command comment terminator whitespace unknown word}
+
+test cst-wordkinds-1 {word_kinds returns the documented list} -body {
+    tclparse::word_kinds
+} -result {bare braced quoted composite}
+
+test cst-accessor-fresh-1 {node_kinds returns a fresh copy — mutation is safe} -body {
+    set a [tclparse::node_kinds]
+    lappend a EXTRA
+    set b [tclparse::node_kinds]
+    list [llength $a] [llength $b]
+} -result {7 6}
+
+test cst-accessor-fresh-2 {word_kinds returns a fresh copy} -body {
+    set a [tclparse::word_kinds]
+    lappend a EXTRA
+    set b [tclparse::word_kinds]
+    list [llength $a] [llength $b]
+} -result {5 4}
+
+# -- CST shape -------------------------------------------------------------
+
+test cst-shape-1 {CST dict carries only `nodes`} -body {
+    set cst [tclparse::parse "set x 1\n"]
+    dict keys $cst
+} -result {nodes}
+
+test cst-shape-2 {No next_id or cst_version at top level} -body {
+    set cst [tclparse::parse "set x 1\n"]
+    set keys [dict keys $cst]
+    expr {[lsearch -exact $keys next_id] == -1 && [lsearch -exact $keys cst_version] == -1}
+} -result 1
+
+test cst-shape-3 {Empty input yields an empty nodes list} -body {
+    set cst [tclparse::parse ""]
+    list [dict keys $cst] [dict get $cst nodes]
+} -result {nodes {}}
+
+# -- Commands --------------------------------------------------------------
+
+test cst-cmd-1 {Single command at top level} -body {
+    set cst [tclparse::parse "set x 1"]
+    top_kinds $cst
+} -result {command}
+
+test cst-cmd-2 {Command body contains words and interior whitespace} -body {
+    set cst [tclparse::parse "set x 1"]
+    set cmd [lindex [dict get $cst nodes] 0]
+    body_kinds $cmd
+} -result {word whitespace word whitespace word}
+
+test cst-cmd-3 {Commands carry no name or class field} -body {
+    set cst [tclparse::parse "set x 1"]
+    set cmd [lindex [dict get $cst nodes] 0]
+    set keys [dict keys $cmd]
+    list [lsearch -exact $keys name] [lsearch -exact $keys class]
+} -result {-1 -1}
+
+test cst-cmd-4 {Command has id, kind, body, line, col — nothing else} -body {
+    set cst [tclparse::parse "set x 1"]
+    set cmd [lindex [dict get $cst nodes] 0]
+    lsort [dict keys $cmd]
+} -result {body col id kind line}
+
+# -- Two commands separated by a newline -----------------------------------
+
+test cst-two-1 {Two commands separated by newline, whitespace is top-level sibling} -body {
+    set cst [tclparse::parse "set x 1\nputs hi"]
+    top_kinds $cst
+} -result {command whitespace command}
+
+test cst-two-2 {Trailing newline after last command is top-level whitespace} -body {
+    set cst [tclparse::parse "set x 1\nputs hi\n"]
+    top_kinds $cst
+} -result {command whitespace command whitespace}
+
+# -- Terminator ------------------------------------------------------------
+
+test cst-term-1 {Terminator closes its command and appears as sibling} -body {
+    set cst [tclparse::parse "a;b"]
+    top_kinds $cst
+} -result {command terminator command}
+
+test cst-term-2 {Terminator carries no text field} -body {
+    set cst [tclparse::parse "a;b"]
+    set t [lindex [dict get $cst nodes] 1]
+    list [dict get $t kind] [dict exists $t text]
+} -result {terminator 0}
+
+# -- Comments --------------------------------------------------------------
+
+test cst-comment-1 {Leading comment is a top-level sibling, not a command} -body {
+    set cst [tclparse::parse "# hi\nset x 1"]
+    top_kinds $cst
+} -result {comment whitespace command}
+
+test cst-comment-2 {End-of-command # (after ;) is a separate comment} -body {
+    set cst [tclparse::parse "puts a;# trailing"]
+    top_kinds $cst
+} -result {command terminator comment}
+
+test cst-comment-3 {Backslash-newline continues a command-start comment} -body {
+    set src " # foo bar\\\ncomment on continuation line\nfoo"
+    set cst [tclparse::parse $src]
+    list \
+        [top_kinds $cst] \
+        [dict get [lindex [dict get $cst nodes] 1] text]
+} -result [list \
+    {whitespace comment whitespace command} \
+    "# foo bar\\\ncomment on continuation line"]
+
+# -- Line continuation -----------------------------------------------------
+
+test cst-contin-1 {Backslash-newline does NOT close the command} -body {
+    set cst [tclparse::parse "set x \\\n    1"]
+    top_kinds $cst
+} -result {command}
+
+test cst-contin-2 {Continuation whitespace lives inside the command body} -body {
+    set cst [tclparse::parse "set x \\\n    1"]
+    set cmd [lindex [dict get $cst nodes] 0]
+    body_kinds $cmd
+} -result {word whitespace word whitespace word}
+
+# -- Word node shape -------------------------------------------------------
+
+test cst-word-1 {word node has id, kind, word_kind, text, line, col — nothing else} -body {
+    set cst [tclparse::parse "set"]
+    set w [lindex [dict get [lindex [dict get $cst nodes] 0] body] 0]
+    lsort [dict keys $w]
+} -result {col id kind line text word_kind}
+
+test cst-word-2 {Braced word is opaque at parse time (text only, no inner)} -body {
+    set src {set x {body content}}
+    set cst [tclparse::parse $src]
+    set w [lindex [dict get [lindex [dict get $cst nodes] 0] body] end]
+    list [dict get $w word_kind] [dict exists $w inner] [dict exists $w text]
+} -result {braced 0 1}
+
+test cst-word-3 {Quoted word kind preserved through CST} -body {
+    set cst [tclparse::parse {set x "hello"}]
+    set w [lindex [dict get [lindex [dict get $cst nodes] 0] body] end]
+    dict get $w word_kind
+} -result quoted
+
+test cst-word-4 {Composite word (contains $var) flagged} -body {
+    set src {set x value_$name}
+    set cst [tclparse::parse $src]
+    set w [lindex [dict get [lindex [dict get $cst nodes] 0] body] end]
+    dict get $w word_kind
+} -result composite
+
+# -- IDs -------------------------------------------------------------------
+
+test cst-ids-1 {All node ids across top and bodies are unique} -body {
+    set cst [tclparse::parse "set x 1\nputs hi\n"]
+    set ids [list]
+    foreach n [flatten $cst] { lappend ids [dict get $n id] }
+    expr {[llength $ids] == [llength [lsort -unique -integer $ids]]}
+} -result 1
+
+test cst-ids-2 {Ids are positive integers} -body {
+    set cst [tclparse::parse "set x 1"]
+    set ok 1
+    foreach n [flatten $cst] {
+        if {![string is integer -strict [dict get $n id]] || [dict get $n id] < 1} {
+            set ok 0
+            break
+        }
+    }
+    set ok
+} -result 1
+
+# -- Empty-whitespace invariant --------------------------------------------
+
+test cst-no-empty-ws-1 {CST never contains empty whitespace nodes} -body {
+    set cst [tclparse::parse "a\nb;c"]
+    foreach n [flatten $cst] {
+        if {[dict get $n kind] eq "whitespace" && [dict get $n text] eq ""} {
+            return FAIL
+        }
+    }
+    return OK
+} -result OK
+
+# -- Recovery / unknown ----------------------------------------------------
+
+test cst-unknown-1 {Unknown before any command is top-level} -body {
+    set cst [tclparse::parse "\uFEFFset x 1"]
+    set first [lindex [dict get $cst nodes] 0]
+    dict get $first kind
+} -result unknown
+
+test cst-unknown-2 {Unknown interior to a command body stays in the body} -body {
+    # Bare close-brace in bare-word position is emitted as unknown by the
+    # lexer (one char wide). With words on either side it falls in the body.
+    set src "set \}trail 1"
+    set cst [tclparse::parse $src]
+    set cmd [lindex [dict get $cst nodes] 0]
+    dict get $cmd kind
+} -result command
+
+# -- Parse is deterministic across fixtures --------------------------------
+
+foreach fixture {minimal.tcl empty.tcl whitespace-only.tcl comment-only.tcl
+                 mixed-quoting.tcl continuation-heavy.tcl edge-cases.tcl
+                 utf8-diacritics.tcl control-flow.tcl} {
+    test cst-fixture-$fixture "Parsing $fixture returns a CST with only `nodes`" -body {
+        set cst [tclparse::parse [load_fixture $fixture]]
+        dict keys $cst
+    } -result {nodes}
+}
+
+cleanupTests

@@ -1,0 +1,214 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+#
+# Integration: exercises portparse on real Portfile shapes and demonstrates
+# the two-namespace idiom. portparse::parse for entry; tclparse::* for CST
+# operations (emit, find, walk_with_path); portparse::* for semantic queries
+# (classify). Every test deliberately crosses the boundary so the intended
+# usage pattern is visible in the suite itself.
+
+package require tcltest 2
+namespace import tcltest::*
+
+source [file join [file dirname [info script]] library.tcl]
+package require portparse 1.0
+package require tclparse 1.0
+
+# -- byte-identical round-trip through portparse::parse -------------------
+# portparse::parse returns a tclparse CST; tclparse::emit consumes it.
+
+foreach fixture {minimal.Portfile site-tags.Portfile phase-bodies.Portfile
+                 nested-variants.Portfile control-flow-portfile.Portfile
+                 modeline.Portfile utf8.Portfile} {
+    test rt-$fixture "portparse::parse round-trips $fixture via tclparse::emit" -body {
+        set src [load_fixture $fixture]
+        expr {[tclparse::emit [portparse::parse $src]] eq $src}
+    } -result 1
+}
+
+# -- find across nested contexts ------------------------------------------
+
+test find-depends-lib-across-depths \
+    {tclparse::find reaches depends_lib-append inside if+variant+foreach} -body {
+    set src [load_fixture control-flow-portfile.Portfile]
+    set cst [portparse::parse $src]
+    # Two inside the top-level if, one inside platform, one inside each
+    # arm of the if nested in the mysql variant = at least 4.
+    set matches [tclparse::find $cst -name depends_lib-append]
+    expr {[llength $matches] >= 4}
+} -result 1
+
+test find-in-variant-body {depends_lib inside a variant body is reachable} -body {
+    set src [load_fixture nested-variants.Portfile]
+    set cst [portparse::parse $src]
+    set matches [tclparse::find $cst -name depends_lib-append]
+    # ssl variant + python27 variant + nested python27_extras variant = 3.
+    expr {[llength $matches] >= 3}
+} -result 1
+
+test find-subport-body {subport body descends and exposes its directives} -body {
+    set src [load_fixture nested-variants.Portfile]
+    set cst [portparse::parse $src]
+    # subport body contains description/depends_lib/build/destroot.
+    set descriptions [tclparse::find $cst -name description]
+    expr {[llength $descriptions] >= 1}
+} -result 1
+
+# -- walk_with_path: ancestor detection -----------------------------------
+# Visitor is a bare proc name (uplevel pattern); collect into a global.
+
+set ::INT_ANCESTOR_HITS [list]
+
+proc int_visit_depends {n anc} {
+    if {[dict get $n kind] ne "command"} { return }
+    if {[tclparse::command_of $n] ne "depends_lib-append"} { return }
+    set anc_names [list]
+    foreach a $anc {
+        lappend anc_names [tclparse::command_of $a]
+    }
+    lappend ::INT_ANCESTOR_HITS $anc_names
+}
+
+test walk-with-path-variant-ancestor \
+    {walk_with_path reports variant as ancestor of nested depends_lib-append} -body {
+    set ::INT_ANCESTOR_HITS [list]
+    set src [load_fixture nested-variants.Portfile]
+    set cst [portparse::parse $src]
+    tclparse::walk_with_path $cst int_visit_depends
+    # At least one hit whose ancestor chain contains "variant".
+    set saw 0
+    foreach chain $::INT_ANCESTOR_HITS {
+        if {"variant" in $chain} { set saw 1; break }
+    }
+    set saw
+} -result 1
+
+test walk-with-path-if-inside-variant \
+    {ancestor chain records both variant and if for doubly-nested depends} -body {
+    set ::INT_ANCESTOR_HITS [list]
+    set src [load_fixture control-flow-portfile.Portfile]
+    set cst [portparse::parse $src]
+    tclparse::walk_with_path $cst int_visit_depends
+    # Inside the mysql variant is an if/else; at least one chain has both.
+    set saw 0
+    foreach chain $::INT_ANCESTOR_HITS {
+        if {"variant" in $chain && "if" in $chain} { set saw 1; break }
+    }
+    set saw
+} -result 1
+
+# -- portparse::classify on every top-level command in site-tags ----------
+# Demonstrates reading the CST at tclparse::, querying semantics at portparse::.
+
+test classify-site-tags-top-level \
+    {every top-level command in site-tags.Portfile classifies as expected} -body {
+    set src [load_fixture site-tags.Portfile]
+    set cst [portparse::parse $src]
+    set unknowns [list]
+    foreach n [tclparse::structural $cst] {
+        if {[dict get $n kind] ne "command"} continue
+        set name [tclparse::command_of $n]
+        set info [portparse::classify $n]
+        if {[dict get $info kind] eq "unknown"} {
+            lappend unknowns $name
+        }
+    }
+    # Every top-level command in this fixture must classify as a
+    # port-directive or tcl-control — no unknowns.
+    set unknowns
+} -result {}
+
+test classify-site-tags-port-directive-kinds \
+    {site-tags.Portfile exercises port-directive classifications} -body {
+    set src [load_fixture site-tags.Portfile]
+    set cst [portparse::parse $src]
+    set kinds [dict create]
+    foreach n [tclparse::structural $cst] {
+        if {[dict get $n kind] ne "command"} continue
+        dict set kinds [dict get [portparse::classify $n] kind] 1
+    }
+    # At minimum must include port-directive.
+    dict exists $kinds port-directive
+} -result 1
+
+test classify-name-category-identity \
+    {portparse::classify on `name` returns category identity} -body {
+    set src [load_fixture minimal.Portfile]
+    set cst [portparse::parse $src]
+    set matches [tclparse::find $cst -name name]
+    set n [lindex $matches 0]
+    dict get [portparse::classify $n] category
+} -result identity
+
+test classify-depends-lib-category-dependency \
+    {classify on depends_lib-append inside variant reports dependency} -body {
+    set src [load_fixture nested-variants.Portfile]
+    set cst [portparse::parse $src]
+    set matches [tclparse::find $cst -name depends_lib-append]
+    set n [lindex $matches 0]
+    dict get [portparse::classify $n] category
+} -result dependency
+
+test classify-variant-category-phase \
+    {variant is classified as category phase} -body {
+    set src [load_fixture nested-variants.Portfile]
+    set cst [portparse::parse $src]
+    set matches [tclparse::find $cst -name variant]
+    set n [lindex $matches 0]
+    dict get [portparse::classify $n] category
+} -result phase
+
+test classify-tcl-control-if \
+    {classify on `if` returns kind tcl-control (not a port directive)} -body {
+    set src [load_fixture control-flow-portfile.Portfile]
+    set cst [portparse::parse $src]
+    set matches [tclparse::find $cst -name if]
+    set n [lindex $matches 0]
+    dict get [portparse::classify $n] kind
+} -result tcl-control
+
+test classify-unknown-misspelled \
+    {classify on misspelled directive returns kind unknown} -body {
+    set src "PortSystem 1.0\ndepnds_lib port:foo\n"
+    set cst [portparse::parse $src]
+    set matches [tclparse::find $cst -name depnds_lib]
+    set n [lindex $matches 0]
+    dict get [portparse::classify $n] kind
+} -result unknown
+
+# -- portparse::parse round-trips even when no descent would apply --------
+
+test parse-minimal-no-body-directives \
+    {minimal Portfile has no body-descent directives and still round-trips} -body {
+    set src [load_fixture minimal.Portfile]
+    expr {[tclparse::emit [portparse::parse $src]] eq $src}
+} -result 1
+
+# -- parse is idempotent on its own output --------------------------------
+
+test parse-idempotent-round-trip \
+    {parse(emit(parse(x))) round-trips identically} -body {
+    set src [load_fixture phase-bodies.Portfile]
+    set once [tclparse::emit [portparse::parse $src]]
+    set twice [tclparse::emit [portparse::parse $once]]
+    expr {$once eq $twice && $once eq $src}
+} -result 1
+
+# -- regression: variant nested inside Tcl control-flow descends ----------
+# Pins Codex P1 finding: handlers must thread the caller's policy so
+# portparse's body_policy reaches variants nested inside if/foreach/etc.
+
+test find-variant-inside-if \
+    {variant body inside `if` is descended and its depends_lib is findable} -body {
+    set src "if {1} {\n    variant foo {\n        depends_lib port:bar\n    }\n}\n"
+    set cst [portparse::parse $src]
+    llength [tclparse::find $cst -name depends_lib]
+} -result 1
+
+test find-variant-inside-foreach \
+    {variant body inside `foreach` is descended} -body {
+    set src "foreach x {1 2} {\n    variant myvariant {\n        depends_lib port:z\n    }\n}\n"
+    set cst [portparse::parse $src]
+    expr {[llength [tclparse::find $cst -name depends_lib]] >= 1}
+} -result 1
+
+cleanupTests

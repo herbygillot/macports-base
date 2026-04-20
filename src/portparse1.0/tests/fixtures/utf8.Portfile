@@ -1,0 +1,17 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+
+PortSystem      1.0
+
+name            utf8
+version         1.0
+categories      test
+license         BSD
+maintainers     nómada@exämple.org
+description     Pörtfile with diácritics — café, résumé, naïve
+long_description {
+    Testing UTF-8: £ € ¥ Ω λ π σ τ φ χ ψ ω
+    Names: Linnér, Olmützer, Sørensen, Ångström.
+}
+homepage        https://example.org/
+platforms       darwin
+supported_archs noarch

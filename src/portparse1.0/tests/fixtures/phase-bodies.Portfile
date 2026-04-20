@@ -1,0 +1,35 @@
+# -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
+
+PortSystem      1.0
+
+name            phase-bodies
+version         1.0
+categories      test
+license         BSD
+platforms       darwin
+supported_archs noarch
+
+pre-fetch {
+    ui_msg "About to fetch"
+}
+
+post-fetch {
+    ui_msg "Fetched"
+}
+
+configure {
+    system "./custom-configure"
+}
+
+build {
+    system -W ${worksrcpath} "make -j${build.jobs}"
+}
+
+destroot {
+    xinstall ${worksrcpath}/bin/foo ${destroot}${prefix}/bin/foo
+}
+
+test.run yes
+test {
+    system -W ${worksrcpath} "./run-tests"
+}
